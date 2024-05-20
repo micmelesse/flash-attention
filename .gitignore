@@ -25,3 +25,10 @@ var/
 
 # Dev
 venv
+
+scripts
+.eggs
+
+.vscode
+core
+log*
