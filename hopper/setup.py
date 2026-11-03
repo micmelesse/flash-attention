@@ -3,6 +3,7 @@
 import sys
 import warnings
 import os
+import importlib.util
 import stat
 import re
 import shutil
@@ -44,8 +45,13 @@ SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 # ROCm specific settings
-USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
-if USE_TRITON_ROCM:
+backend_spec = importlib.util.spec_from_file_location(
+    "flash_attn_backend", Path(this_dir) / "flash_attn_interface_aiter.py"
+)
+backend_module = importlib.util.module_from_spec(backend_spec)
+backend_spec.loader.exec_module(backend_module)
+USE_PYTHON_ROCM_BACKEND = backend_module.select_amd_backend() in ("triton", "aiter")
+if USE_PYTHON_ROCM_BACKEND:
     SKIP_CUDA_BUILD = True
 
 DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
@@ -494,7 +500,7 @@ cmdclass = {}
 ext_modules = []
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
-if not USE_TRITON_ROCM:
+if not USE_PYTHON_ROCM_BACKEND:
     subprocess.run(["git", "submodule", "update", "--init", "../csrc/cutlass"])
 
 if not SKIP_CUDA_BUILD:
@@ -821,7 +827,7 @@ setup(
             "benchmarks",
         )
     ),
-    py_modules=["flash_attn_interface", "flash_attn_config"],
+    py_modules=["flash_attn_interface", "flash_attn_interface_aiter", "flash_attn_config"],
     description="FlashAttention-3",
     long_description=long_description,
     long_description_content_type="text/markdown",
