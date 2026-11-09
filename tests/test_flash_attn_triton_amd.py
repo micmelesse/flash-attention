@@ -6,7 +6,6 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn.functional as F
-from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import get_arch, is_hip
 from einops import rearrange, repeat
 
 from flash_attn import (
@@ -26,12 +25,16 @@ from flash_attn.flash_attn_interface import AITER_IMPL, AMD_BACKEND, _get_block_
 from flash_attn.layers.rotary import apply_rotary_emb
 
 
+ARCH = torch.cuda.get_device_properties("cuda").gcnArchName if torch.version.hip else ""
+IS_RDNA = ARCH.startswith(("gfx11", "gfx12"))
+IS_CDNA = ARCH.startswith("gfx9")
+
+
 def _get_block_size_n_triton(device, head_dim, is_dropout, is_causal):
     """Get block size for Triton AMD kernel."""
-    arch = get_arch()
-    if arch.is_rdna:
+    if IS_RDNA:
         return 32
-    elif arch.is_cdna:
+    elif IS_CDNA:
         return 64
     # Fall back to CUDA kernel block sizes
     return _get_block_size_n(device, head_dim, is_dropout, is_causal)
@@ -45,7 +48,7 @@ is_sm8x = torch.cuda.get_device_capability("cuda")[0] == 8
 is_sm80 = torch.cuda.get_device_capability("cuda") == (8, 0)
 is_sm90 = torch.cuda.get_device_capability("cuda") == (9, 0)
 
-skip_bfloat16 = True if is_sm75 or is_hip() else False
+skip_bfloat16 = True if is_sm75 or torch.version.hip is not None else False
 
 
 def attn_bias_from_alibi_slopes(
@@ -1510,7 +1513,7 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
 def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
     if AITER_IMPL == "triton":
-        if get_arch().is_rdna:
+        if IS_RDNA:
             if seqlen_q == 1 and seqlen_k == 239 and d == 256:
                 pytest.skip("This config doesnot work on RDNA Devices.")
     if (
@@ -2574,25 +2577,24 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
 def aiter_calls(monkeypatch):
     """Stand in for aiter's Triton and general MHA entry points and select the general
     implementation; monkeypatch undoes both after the test."""
-    triton_fa2 = types.SimpleNamespace(
-        fwd=Mock(return_value=("to", "tl", "tp", "tr")),
-        bwd=Mock(return_value=("tq", "tk", "tv", "td")),
-        varlen_fwd=Mock(return_value=("tvo", "tvl", "tvp", "tvr")),
-        varlen_bwd=Mock(return_value=("tvq", "tvk", "tvv", "tvd")),
-        fwd_kvcache=Mock(return_value=("tco", "tcl")),
+    triton_mha = types.SimpleNamespace(
+        _flash_attn_forward=Mock(return_value=("to", "tl", "tp", 0, 0, "tr")),
+        _flash_attn_backward=Mock(return_value="td"),
+        flash_attn_with_kvcache=Mock(return_value=("tco", "tcl")),
     )
-    general = types.ModuleType("aiter.ops.mha")
+    general = types.SimpleNamespace()
     general._flash_attn_forward = Mock(return_value=("o", "l", "p", "r"))
     general._flash_attn_backward = Mock(return_value="softmax_d")
     general._flash_attn_varlen_forward = Mock(return_value=("vo", "vl", "vp", "vr"))
     general._flash_attn_varlen_backward = Mock(return_value="varlen_d")
     ops = types.ModuleType("aiter.ops")
     ops.mha = general
+    attention = types.ModuleType("aiter.ops.triton.attention")
+    attention.mha = triton_mha
     monkeypatch.setitem(sys.modules, "aiter.ops", ops)
-    monkeypatch.setitem(sys.modules, "aiter.ops.mha", general)
-    monkeypatch.setattr(adapter, "_triton_fa2", triton_fa2)
+    monkeypatch.setitem(sys.modules, "aiter.ops.triton.attention", attention)
     monkeypatch.setattr(adapter, "AITER_IMPL", "general")
-    return types.SimpleNamespace(triton=triton_fa2, general=general)
+    return types.SimpleNamespace(triton=triton_mha, general=general)
 
 
 def test_general_dense_forward_uses_aiter_dispatch(aiter_calls):
@@ -2608,7 +2610,7 @@ def test_general_dense_forward_uses_aiter_dispatch(aiter_calls):
     assert args[:9] == ("q", "k", "v", 0.1, 0.5, True, 4, 2, 0)
     assert args[10] == "alibi"
     assert args[14] and args[15]
-    aiter_calls.triton.fwd.assert_not_called()
+    aiter_calls.triton._flash_attn_forward.assert_not_called()
 
 
 def test_general_dense_backward_preserves_fa2_return(aiter_calls):
@@ -2620,7 +2622,7 @@ def test_general_dense_backward_preserves_fa2_return(aiter_calls):
     args = aiter_calls.general._flash_attn_backward.call_args.args
     assert args[:9] == ("do", "q", "k", "v", "out", "lse", "dq", "dk", "dv")
     assert args[18] == "rng"
-    aiter_calls.triton.bwd.assert_not_called()
+    aiter_calls.triton._flash_attn_backward.assert_not_called()
 
 
 def test_general_varlen_forward_passes_block_table(aiter_calls):
@@ -2632,7 +2634,7 @@ def test_general_varlen_forward_passes_block_table(aiter_calls):
     call = aiter_calls.general._flash_attn_varlen_forward.call_args
     assert call.args[:10] == ("q", "k", "v", "cq", "ck", None, None, 64, 128, 0)
     assert call.kwargs["block_table"] == "blocks"
-    aiter_calls.triton.varlen_fwd.assert_not_called()
+    aiter_calls.triton._flash_attn_forward.assert_not_called()
 
 
 def test_general_varlen_dropout_record_matches_fa2_layout(aiter_calls):
@@ -2661,7 +2663,7 @@ def test_general_varlen_backward_preserves_fa2_return(aiter_calls):
     args = aiter_calls.general._flash_attn_varlen_backward.call_args.args
     assert args[:11] == ("do", "q", "k", "v", "out", "lse", "dq", "dk", "dv", "cq", "ck")
     assert args[20] == "rng"
-    aiter_calls.triton.varlen_bwd.assert_not_called()
+    aiter_calls.triton._flash_attn_backward.assert_not_called()
 
 
 def test_general_cache_is_not_supported(aiter_calls):
@@ -2670,7 +2672,7 @@ def test_general_cache_is_not_supported(aiter_calls):
             "q", "kc", "vc", None, None, None, None, None, None, None,
             None, None, None, 0.5, True, -1, -1, 0.0, True, 0,
         )
-    aiter_calls.triton.fwd_kvcache.assert_not_called()
+    aiter_calls.triton.flash_attn_with_kvcache.assert_not_called()
 
 
 def test_general_unsupported_args_fail_explicitly(aiter_calls):
@@ -2683,12 +2685,34 @@ def test_general_unsupported_args_fail_explicitly(aiter_calls):
         )
 
 
-def test_triton_route_delegates_low_level_calls(aiter_calls, monkeypatch):
+def test_triton_route_uses_aiter_mha_with_dao_ai(aiter_calls, monkeypatch):
     monkeypatch.setattr(adapter, "AITER_IMPL", "triton")
-    result = adapter.flash_attn_2.fwd("q", "k", "v", None, None, 0.0, 0.5, False, -1, -1, 0.0, False)
+    q = torch.empty(2, 3, 1, 8)
+    result = adapter.flash_attn_2.fwd(q, q, q, None, None, 0.0, 0.5, False, -1, -1, 0.0, False)
     assert result == ("to", "tl", "tp", "tr")
-    aiter_calls.triton.fwd.assert_called_once()
+    assert aiter_calls.triton._flash_attn_forward.call_args.kwargs == {"implementation": "dao_ai"}
+    result = adapter.flash_attn_2.varlen_bwd(
+        "do", "q", "k", "v", "out", "lse", "dq", "dk", "dv",
+        "cq", "ck", None, 64, 128, 0.0, 0.5, False, True,
+        -1, -1, 0.0, False, None, "rng",
+    )
+    assert result == ("dq", "dk", "dv", "td")
+    call = aiter_calls.triton._flash_attn_backward.call_args
+    assert call.args[17:19] == (64, 128)
+    assert call.kwargs == dict(
+        cu_seqlens_q="cq", cu_seqlens_k="ck", rng_state="rng", implementation="dao_ai"
+    )
     aiter_calls.general._flash_attn_forward.assert_not_called()
+
+
+def test_triton_varlen_refuses_block_table(aiter_calls, monkeypatch):
+    monkeypatch.setattr(adapter, "AITER_IMPL", "triton")
+    with pytest.raises(NotImplementedError, match="block_table"):
+        adapter.flash_attn_2.varlen_fwd(
+            "q", "k", "v", None, "cq", "ck", None, None, "blocks",
+            None, 64, 128, 0.0, 0.5, False, True, -1, -1, 0.0, False,
+        )
+    aiter_calls.triton._flash_attn_forward.assert_not_called()
 
 
 def test_interface_uses_the_adapter():

@@ -282,16 +282,12 @@ def check_system_aiter():
     spec = importlib.util.find_spec("aiter")
     locations = list(spec.submodule_search_locations or []) if spec is not None else []
     public_mha = os.path.join("ops", "triton", "attention", "mha.py")
-    dao_ai = os.path.join("ops", "triton", "_triton_kernels", "attention", "dao_ai")
-    if any(
-        os.path.isfile(os.path.join(root, public_mha))
-        and os.path.isdir(os.path.join(root, dao_ai))
-        for root in locations
-    ):
+    if any(os.path.isfile(os.path.join(root, public_mha)) for root in locations):
         return
     raise RuntimeError(
         "FLASH_ATTENTION_USE_SYSTEM_AITER=TRUE was set, but no installed aiter provides "
-        "the public Triton MHA API and Dao-AI kernels. Install a compatible aiter."
+        "aiter.ops.triton.attention.mha. Install a compatible aiter, or unset "
+        "FLASH_ATTENTION_USE_SYSTEM_AITER to build the bundled third_party/aiter."
     )
 
 
@@ -307,16 +303,6 @@ if IS_ROCM:
             else:
                 assert os.path.isdir("third_party/aiter"), (
                     "third_party/aiter is missing, please use source distribution or git clone"
-                )
-            bundled_dao_ai = os.path.join(
-                "third_party", "aiter", "aiter", "ops", "triton", "_triton_kernels",
-                "attention", "dao_ai",
-            )
-            if not os.path.isdir(bundled_dao_ai):
-                raise RuntimeError(
-                    "The bundled aiter revision predates the public Dao-AI MHA API. "
-                    "Install an aiter revision with this API and set "
-                    "FLASH_ATTENTION_USE_SYSTEM_AITER=TRUE."
                 )
             subprocess.run(
                 [sys.executable, "-m", "pip", "install", "--no-build-isolation", "third_party/aiter"],

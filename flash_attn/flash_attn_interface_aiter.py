@@ -1,4 +1,4 @@
-"""FA2 low-level ABI backed by the ROCm Triton or general aiter dispatcher."""
+"""FA2 low-level ABI backed by aiter's Triton MHA (implementation="dao_ai") or its general MHA."""
 
 import math
 from types import SimpleNamespace
@@ -6,11 +6,10 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from aiter.ops.triton._triton_kernels.attention.dao_ai import flash_attn_2 as _triton_fa2
 from flash_attn.flash_attn_interface import AITER_IMPL
 
 
-def _check_general_args(softcap, gen):
+def _check_args(softcap, gen):
     if softcap != 0.0:
         raise NotImplementedError("softcap is not supported by the FA2 aiter adapter")
     if gen is not None:
@@ -50,27 +49,32 @@ def fwd(
     return_softmax,
     gen=None,
 ):
+    _check_args(softcap, gen)
     if AITER_IMPL == "triton":
-        return _triton_fa2.fwd(
+        from aiter.ops.triton.attention import mha as triton_mha
+
+        out, softmax_lse, s_dmask, _, _, rng_state = triton_mha._flash_attn_forward(
             q,
             k,
             v,
-            out,
-            alibi_slopes,
             dropout_p,
             softmax_scale,
             causal,
             window_size_left,
             window_size_right,
-            softcap,
+            None,
+            alibi_slopes,
+            True,
             return_softmax,
-            gen,
+            q.shape[1],
+            k.shape[1],
+            implementation="dao_ai",
         )
+        return out, softmax_lse, s_dmask, rng_state
     else:
-        _check_general_args(softcap, gen)
-        from aiter.ops import mha
+        from aiter.ops import mha as general_mha
 
-        out, softmax_lse, s_dmask, rng_state = mha._flash_attn_forward(
+        out, softmax_lse, s_dmask, rng_state = general_mha._flash_attn_forward(
             q,
             k,
             v,
@@ -115,8 +119,11 @@ def bwd(
     gen=None,
     rng_state=None,
 ):
+    _check_args(softcap, gen)
     if AITER_IMPL == "triton":
-        return _triton_fa2.bwd(
+        from aiter.ops.triton.attention import mha as triton_mha
+
+        softmax_d = triton_mha._flash_attn_backward(
             dout,
             q,
             k,
@@ -126,26 +133,27 @@ def bwd(
             dq,
             dk,
             dv,
-            alibi_slopes,
+            None,
             dropout_p,
             softmax_scale,
             causal,
             window_size_left,
             window_size_right,
-            softcap,
+            alibi_slopes,
             deterministic,
-            gen,
-            rng_state,
+            q.shape[1],
+            k.shape[1],
+            rng_state=rng_state,
+            implementation="dao_ai",
         )
+        return dq, dk, dv, softmax_d
     else:
-        _check_general_args(softcap, gen)
-        from aiter.ops import mha
-        import torch
+        from aiter.ops import mha as general_mha
 
         dq = torch.empty_like(q) if dq is None else dq
         dk = torch.empty_like(k) if dk is None else dk
         dv = torch.empty_like(v) if dv is None else dv
-        softmax_d = mha._flash_attn_backward(
+        softmax_d = general_mha._flash_attn_backward(
             dout,
             q,
             k,
@@ -193,42 +201,44 @@ def varlen_fwd(
     gen=None,
     num_splits=0,
 ):
+    _check_args(softcap, gen)
+    if seqused_k is not None or leftpad_k is not None:
+        raise NotImplementedError(
+            "seqused_k and leftpad_k are not supported by the FA2 aiter adapter"
+        )
+    if num_splits not in (0, 1):
+        raise NotImplementedError("num_splits is not supported by the FA2 aiter adapter")
     if AITER_IMPL == "triton":
-        return _triton_fa2.varlen_fwd(
+        if block_table is not None:
+            raise NotImplementedError(
+                "block_table is not supported by the aiter triton implementation"
+            )
+        from aiter.ops.triton.attention import mha as triton_mha
+
+        out, softmax_lse, s_dmask, _, _, rng_state = triton_mha._flash_attn_forward(
             q,
             k,
             v,
-            out,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_k,
-            leftpad_k,
-            block_table,
-            alibi_slopes,
-            max_seqlen_q,
-            max_seqlen_k,
             dropout_p,
             softmax_scale,
-            zero_tensors,
             causal,
             window_size_left,
             window_size_right,
-            softcap,
+            None,
+            alibi_slopes,
+            True,
             return_softmax,
-            gen,
-            num_splits,
+            max_seqlen_q,
+            max_seqlen_k,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            implementation="dao_ai",
         )
+        return out, softmax_lse, s_dmask, rng_state
     else:
-        _check_general_args(softcap, gen)
-        if seqused_k is not None or leftpad_k is not None:
-            raise NotImplementedError(
-                "seqused_k and leftpad_k are not supported by the FA2 aiter adapter"
-            )
-        if num_splits != 0:
-            raise NotImplementedError("num_splits is not supported by the FA2 aiter adapter")
-        from aiter.ops import mha
+        from aiter.ops import mha as general_mha
 
-        out, softmax_lse, s_dmask, rng_state = mha._flash_attn_varlen_forward(
+        out, softmax_lse, s_dmask, rng_state = general_mha._flash_attn_varlen_forward(
             q,
             k,
             v,
@@ -290,8 +300,11 @@ def varlen_bwd(
     gen=None,
     rng_state=None,
 ):
+    _check_args(softcap, gen)
     if AITER_IMPL == "triton":
-        return _triton_fa2.varlen_bwd(
+        from aiter.ops.triton.attention import mha as triton_mha
+
+        softmax_d = triton_mha._flash_attn_backward(
             dout,
             q,
             k,
@@ -301,31 +314,29 @@ def varlen_bwd(
             dq,
             dk,
             dv,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            alibi_slopes,
-            max_seqlen_q,
-            max_seqlen_k,
+            None,
             dropout_p,
             softmax_scale,
-            zero_tensors,
             causal,
             window_size_left,
             window_size_right,
-            softcap,
+            alibi_slopes,
             deterministic,
-            gen,
-            rng_state,
+            max_seqlen_q,
+            max_seqlen_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            rng_state=rng_state,
+            implementation="dao_ai",
         )
+        return dq, dk, dv, softmax_d
     else:
-        _check_general_args(softcap, gen)
-        from aiter.ops import mha
-        import torch
+        from aiter.ops import mha as general_mha
 
         dq = torch.empty_like(q) if dq is None else dq
         dk = torch.empty_like(k) if dk is None else dk
         dv = torch.empty_like(v) if dv is None else dv
-        softmax_d = mha._flash_attn_varlen_backward(
+        softmax_d = general_mha._flash_attn_varlen_backward(
             dout,
             q,
             k,
@@ -375,27 +386,30 @@ def fwd_kvcache(
     num_splits,
 ):
     if AITER_IMPL == "triton":
-        return _triton_fa2.fwd_kvcache(
+        if out is not None:
+            raise NotImplementedError("out is not supported by the FA2 aiter adapter")
+        from aiter.ops.triton.attention import mha as triton_mha
+
+        return triton_mha.flash_attn_with_kvcache(
             q,
             k_cache,
             v_cache,
             k,
             v,
             cache_seqlens,
+            softmax_scale,
+            causal,
+            (window_size_left, window_size_right),
+            softcap,
+            num_splits,
             rotary_cos,
             rotary_sin,
             cache_batch_idx,
             cache_leftpad,
             block_table,
             alibi_slopes,
-            out,
-            softmax_scale,
-            causal,
-            window_size_left,
-            window_size_right,
-            softcap,
             rotary_interleaved,
-            num_splits,
+            return_softmax_lse=True,
         )
     raise NotImplementedError(
         "KV-cache attention is not supported by the aiter general implementation. "
