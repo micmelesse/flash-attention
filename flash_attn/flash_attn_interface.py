@@ -10,6 +10,7 @@ from flash_attn.amd_backend import select_amd_backend
 # isort: off
 # We need to import the CUDA kernels after importing torch
 AMD_BACKEND, AITER_IMPL = select_amd_backend(getattr(torch.version, 'hip', None) is not None)
+USE_TRITON_ROCM = AITER_IMPL == "triton"
 
 if AMD_BACKEND == "aiter":
     from flash_attn.flash_attn_interface_aiter import flash_attn_2 as flash_attn_gpu

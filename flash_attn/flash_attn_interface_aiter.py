@@ -71,6 +71,10 @@ def fwd(
             implementation="dao_ai",
         )
     else:
+        if return_softmax and dropout_p == 0:
+            raise NotImplementedError(
+                "return_softmax without dropout is not supported by the aiter general implementation"
+            )
         from aiter.ops import mha as general_mha
 
         out, softmax_lse, s_dmask, rng_state = general_mha._flash_attn_forward(
@@ -246,6 +250,10 @@ def varlen_fwd(
             implementation="dao_ai",
         )
     else:
+        if return_softmax and dropout_p == 0:
+            raise NotImplementedError(
+                "return_softmax without dropout is not supported by the aiter general implementation"
+            )
         from aiter.ops import mha as general_mha
 
         out, softmax_lse, s_dmask, rng_state = general_mha._flash_attn_varlen_forward(
@@ -381,7 +389,8 @@ def varlen_bwd(
             zero_tensors=zero_tensors,
         )
         # CK allocates (batch, heads, total_q) and writes every token to batch row 0.
-        softmax_d = softmax_d[0]
+        if softmax_d.dim() == 3:
+            softmax_d = softmax_d[0]
     # FA's register_fake for _flash_attn_varlen_backward describes softmax_d.
     assert softmax_d.shape == (q.shape[1], q.shape[0]), softmax_d.shape
     assert softmax_d.dtype == torch.float32, softmax_d.dtype
