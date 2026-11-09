@@ -70,7 +70,6 @@ def fwd(
             k.shape[1],
             implementation="dao_ai",
         )
-        return out, softmax_lse, s_dmask, rng_state
     else:
         from aiter.ops import mha as general_mha
 
@@ -94,8 +93,18 @@ def fwd(
             out=out,
         )
         if return_softmax and dropout_p > 0:
-            s_dmask = _fa_dropout_pattern(s_dmask, dropout_p)
-        return out, softmax_lse, s_dmask, rng_state
+            s_dmask = _fa_dropout_pattern(s_dmask, dropout_p).to(q.dtype)
+        else:
+            s_dmask = torch.empty((0,), dtype=q.dtype, device=q.device)
+    # FA's register_fake for _flash_attn_forward describes these returns.
+    batch, seqlen_q, nheads, _ = q.shape
+    s_dmask_shape = (batch, nheads, seqlen_q, k.shape[1]) if return_softmax else (0,)
+    assert s_dmask.shape == s_dmask_shape and s_dmask.dtype == q.dtype, s_dmask.shape
+    assert out.shape == q.shape[:-1] + v.shape[-1:] and out.dtype == q.dtype, out.shape
+    assert softmax_lse.shape == (batch, nheads, seqlen_q), softmax_lse.shape
+    assert softmax_lse.dtype == torch.float32, softmax_lse.dtype
+    assert rng_state.shape == (2,) and rng_state.dtype == torch.int64, rng_state
+    return out, softmax_lse, s_dmask, rng_state
 
 
 def bwd(
@@ -146,7 +155,6 @@ def bwd(
             rng_state=rng_state,
             implementation="dao_ai",
         )
-        return dq, dk, dv, softmax_d
     else:
         from aiter.ops import mha as general_mha
 
@@ -174,7 +182,10 @@ def bwd(
             deterministic,
             rng_state,
         )
-        return dq, dk, dv, softmax_d
+    # FA's register_fake for _flash_attn_backward describes softmax_d.
+    assert softmax_d.shape == q.shape[:1] + (q.shape[2], q.shape[1]), softmax_d.shape
+    assert softmax_d.dtype == torch.float32, softmax_d.dtype
+    return dq, dk, dv, softmax_d
 
 
 def varlen_fwd(
@@ -234,7 +245,6 @@ def varlen_fwd(
             cu_seqlens_k,
             implementation="dao_ai",
         )
-        return out, softmax_lse, s_dmask, rng_state
     else:
         from aiter.ops import mha as general_mha
 
@@ -270,8 +280,19 @@ def varlen_fwd(
         if return_softmax and dropout_p > 0:
             s_dmask = _fa_dropout_pattern(
                 s_dmask, dropout_p, cu_seqlens_q, max_seqlen_q, max_seqlen_k
-            )
-        return out, softmax_lse, s_dmask, rng_state
+            ).to(q.dtype)
+        else:
+            s_dmask = torch.empty((0,), dtype=q.dtype, device=q.device)
+    # FA's register_fake for _flash_attn_varlen_forward describes these returns.
+    batch = cu_seqlens_q.numel() - 1
+    total_q, nheads, _ = q.shape
+    s_dmask_shape = (batch, nheads, max_seqlen_q, max_seqlen_k) if return_softmax else (0,)
+    assert s_dmask.shape == s_dmask_shape and s_dmask.dtype == q.dtype, s_dmask.shape
+    assert out.shape == q.shape[:-1] + v.shape[-1:] and out.dtype == q.dtype, out.shape
+    assert softmax_lse.shape == (nheads, total_q), softmax_lse.shape
+    assert softmax_lse.dtype == torch.float32, softmax_lse.dtype
+    assert rng_state.shape == (2,) and rng_state.dtype == torch.int64, rng_state
+    return out, softmax_lse, s_dmask, rng_state
 
 
 def varlen_bwd(
@@ -329,7 +350,6 @@ def varlen_bwd(
             rng_state=rng_state,
             implementation="dao_ai",
         )
-        return dq, dk, dv, softmax_d
     else:
         from aiter.ops import mha as general_mha
 
@@ -360,7 +380,12 @@ def varlen_bwd(
             rng_state,
             zero_tensors=zero_tensors,
         )
-        return dq, dk, dv, softmax_d
+        # CK allocates (batch, heads, total_q) and writes every token to batch row 0.
+        softmax_d = softmax_d[0]
+    # FA's register_fake for _flash_attn_varlen_backward describes softmax_d.
+    assert softmax_d.shape == (q.shape[1], q.shape[0]), softmax_d.shape
+    assert softmax_d.dtype == torch.float32, softmax_d.dtype
+    return dq, dk, dv, softmax_d
 
 
 def fwd_kvcache(
@@ -390,7 +415,7 @@ def fwd_kvcache(
             raise NotImplementedError("out is not supported by the FA2 aiter adapter")
         from aiter.ops.triton.attention import mha as triton_mha
 
-        return triton_mha.flash_attn_with_kvcache(
+        out, softmax_lse = triton_mha.flash_attn_with_kvcache(
             q,
             k_cache,
             v_cache,
@@ -411,6 +436,11 @@ def fwd_kvcache(
             rotary_interleaved,
             return_softmax_lse=True,
         )
+        # What flash_attn_with_kvcache returns on the other backends.
+        assert out.shape == q.shape[:-1] + v_cache.shape[-1:] and out.dtype == q.dtype, out.shape
+        assert softmax_lse.shape == (q.shape[0], q.shape[2], q.shape[1]), softmax_lse.shape
+        assert softmax_lse.dtype == torch.float32, softmax_lse.dtype
+        return out, softmax_lse
     raise NotImplementedError(
         "KV-cache attention is not supported by the aiter general implementation. "
         "Use FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE."

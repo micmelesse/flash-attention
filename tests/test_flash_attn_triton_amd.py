@@ -2573,20 +2573,69 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         assert torch.equal(dq, dq0)
 
 
+@pytest.mark.skipif(not hasattr(torch.library, "opcheck"), reason="needs torch.library.opcheck")
+@pytest.mark.parametrize("dropout_p, return_softmax", [(0.0, False), (0.17, False), (0.17, True)])
+@pytest.mark.parametrize("varlen", [False, True])
+def test_flash_attn_custom_ops_match_fake(varlen, dropout_p, return_softmax):
+    """Each backend call returns what FA's register_fake declares, so torch.compile can trace it."""
+    torch.manual_seed(0)
+    batch, seqlen, nheads, d = 2, 128, 4, 64
+    q, k, v = (
+        torch.randn(batch, seqlen, nheads, d, device="cuda", dtype=torch.float16) for _ in range(3)
+    )
+    if varlen:
+        q, k, v = (x.flatten(0, 1) for x in (q, k, v))
+        cu_seqlens = torch.arange(
+            0, (batch + 1) * seqlen, seqlen, device="cuda", dtype=torch.int32
+        )
+        fwd_op = torch.ops.flash_attn._flash_attn_varlen_forward
+        bwd_op = torch.ops.flash_attn._flash_attn_varlen_backward
+        seqlens = (cu_seqlens, cu_seqlens, seqlen, seqlen)
+    else:
+        fwd_op = torch.ops.flash_attn._flash_attn_forward
+        bwd_op = torch.ops.flash_attn._flash_attn_backward
+        seqlens = ()
+    options = dict(
+        dropout_p=dropout_p,
+        softmax_scale=d**-0.5,
+        causal=True,
+        window_size_left=-1,
+        window_size_right=-1,
+        softcap=0.0,
+        alibi_slopes=None,
+    )
+    utils = ("test_schema", "test_faketensor")
+    fwd_args = (q, k, v, *seqlens)
+    torch.library.opcheck(fwd_op, fwd_args, dict(options, return_softmax=return_softmax), test_utils=utils)
+
+    out, softmax_lse, _, rng_state = fwd_op(*fwd_args, **options, return_softmax=return_softmax)
+    grads = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))
+    bwd_args = (torch.randn_like(out), q, k, v, out, softmax_lse, *grads, *seqlens)
+    torch.library.opcheck(
+        bwd_op, bwd_args, dict(options, deterministic=False, rng_state=rng_state), test_utils=utils
+    )
+
+
 @pytest.fixture
 def aiter_calls(monkeypatch):
     """Stand in for aiter's Triton and general MHA entry points and select the general
-    implementation; monkeypatch undoes both after the test."""
+    implementation; monkeypatch undoes both after the test. The stand-ins return tensors of
+    the shapes FA's fake ops declare: batch 2, seqlen 3, one head, head dim 8; varlen has
+    cu_seqlens [0, 1, 3]."""
+    q = torch.zeros(2, 3, 1, 8)
+    vq = torch.zeros(3, 1, 8)
+    rng = torch.zeros(2, dtype=torch.int64)
+    none = torch.empty(0)
     triton_mha = types.SimpleNamespace(
-        _flash_attn_forward=Mock(return_value=("to", "tl", "tp", 0, 0, "tr")),
-        _flash_attn_backward=Mock(return_value="td"),
-        flash_attn_with_kvcache=Mock(return_value=("tco", "tcl")),
+        _flash_attn_forward=Mock(return_value=(q, torch.zeros(2, 1, 3), none, 0, 0, rng)),
+        _flash_attn_backward=Mock(return_value=torch.zeros(1, 3)),
+        flash_attn_with_kvcache=Mock(return_value=(q, torch.zeros(2, 1, 3))),
     )
     general = types.SimpleNamespace()
-    general._flash_attn_forward = Mock(return_value=("o", "l", "p", "r"))
-    general._flash_attn_backward = Mock(return_value="softmax_d")
-    general._flash_attn_varlen_forward = Mock(return_value=("vo", "vl", "vp", "vr"))
-    general._flash_attn_varlen_backward = Mock(return_value="varlen_d")
+    general._flash_attn_forward = Mock(return_value=(q, torch.zeros(2, 1, 3), none, rng))
+    general._flash_attn_backward = Mock(return_value=torch.zeros(2, 1, 3))
+    general._flash_attn_varlen_forward = Mock(return_value=(vq, torch.zeros(1, 3), none, rng))
+    general._flash_attn_varlen_backward = Mock(return_value=torch.zeros(2, 1, 3))
     ops = types.ModuleType("aiter.ops")
     ops.mha = general
     attention = types.ModuleType("aiter.ops.triton.attention")
@@ -2594,45 +2643,54 @@ def aiter_calls(monkeypatch):
     monkeypatch.setitem(sys.modules, "aiter.ops", ops)
     monkeypatch.setitem(sys.modules, "aiter.ops.triton.attention", attention)
     monkeypatch.setattr(adapter, "AITER_IMPL", "general")
-    return types.SimpleNamespace(triton=triton_mha, general=general)
+    return types.SimpleNamespace(
+        triton=triton_mha, general=general, q=q, vq=vq, rng=rng, cu=torch.tensor([0, 1, 3])
+    )
 
 
 def test_general_dense_forward_uses_aiter_dispatch(aiter_calls):
     # aiter returns CK's random bytes; FA's record is >= 0 kept, < 0 dropped.
-    randval = torch.tensor([0, 18, 229, 230, 255], dtype=torch.uint8)
-    aiter_calls.general._flash_attn_forward.return_value = ("o", "l", randval, "r")
-    result = adapter.flash_attn_2.fwd(
-        "q", "k", "v", None, "alibi", 0.1, 0.5, True, 4, 2, 0.0, True
+    randval = torch.zeros(18, dtype=torch.uint8)
+    randval[:5] = torch.tensor([0, 18, 229, 230, 255])
+    randval = randval.view(2, 1, 3, 3)
+    q, rng = aiter_calls.q, aiter_calls.rng
+    aiter_calls.general._flash_attn_forward.return_value = (q, torch.zeros(2, 1, 3), randval, rng)
+    out, _, s_dmask, rng_state = adapter.flash_attn_2.fwd(
+        q, q, q, None, "alibi", 0.1, 0.5, True, 4, 2, 0.0, True
     )
-    assert (result[0], result[1], result[3]) == ("o", "l", "r")
-    assert torch.equal(result[2], torch.tensor([229.0, 211.0, 0.0, -1.0, -26.0]))
+    assert out is q and rng_state is rng
+    assert s_dmask.shape == (2, 1, 3, 3) and s_dmask.dtype == q.dtype
+    assert torch.equal(s_dmask.flatten()[:5], torch.tensor([229.0, 211.0, 0.0, -1.0, -26.0]))
     args = aiter_calls.general._flash_attn_forward.call_args.args
-    assert args[:9] == ("q", "k", "v", 0.1, 0.5, True, 4, 2, 0)
+    assert args[0] is q and args[3:9] == (0.1, 0.5, True, 4, 2, 0)
     assert args[10] == "alibi"
     assert args[14] and args[15]
     aiter_calls.triton._flash_attn_forward.assert_not_called()
 
 
 def test_general_dense_backward_preserves_fa2_return(aiter_calls):
+    q, rng = aiter_calls.q, aiter_calls.rng
+    grads = (torch.zeros_like(q), torch.zeros_like(q), torch.zeros_like(q))
     result = adapter.flash_attn_2.bwd(
-        "do", "q", "k", "v", "out", "lse", "dq", "dk", "dv",
-        None, 0.0, 0.5, True, -1, -1, 0.0, False, None, "rng",
+        q, q, q, q, q, torch.zeros(2, 1, 3), *grads,
+        None, 0.0, 0.5, True, -1, -1, 0.0, False, None, rng,
     )
-    assert result == ("dq", "dk", "dv", "softmax_d")
+    assert all(r is g for r, g in zip(result[:3], grads))
+    assert result[3] is aiter_calls.general._flash_attn_backward.return_value
     args = aiter_calls.general._flash_attn_backward.call_args.args
-    assert args[:9] == ("do", "q", "k", "v", "out", "lse", "dq", "dk", "dv")
-    assert args[18] == "rng"
+    assert args[6] is grads[0] and args[18] is rng
     aiter_calls.triton._flash_attn_backward.assert_not_called()
 
 
 def test_general_varlen_forward_passes_block_table(aiter_calls):
+    vq, cu = aiter_calls.vq, aiter_calls.cu
     result = adapter.flash_attn_2.varlen_fwd(
-        "q", "k", "v", None, "cq", "ck", None, None, "blocks",
-        None, 64, 128, 0.0, 0.5, False, True, -1, -1, 0.0, False,
+        vq, vq, vq, None, cu, cu, None, None, "blocks",
+        None, 2, 3, 0.0, 0.5, False, True, -1, -1, 0.0, False,
     )
-    assert result == ("vo", "vl", "vp", "vr")
+    assert result[0] is vq and result[2].shape == (0,)
     call = aiter_calls.general._flash_attn_varlen_forward.call_args
-    assert call.args[:10] == ("q", "k", "v", "cq", "ck", None, None, 64, 128, 0)
+    assert call.args[0] is vq and call.args[5:10] == (None, None, 2, 3, 0)
     assert call.kwargs["block_table"] == "blocks"
     aiter_calls.triton._flash_attn_forward.assert_not_called()
 
@@ -2640,10 +2698,11 @@ def test_general_varlen_forward_passes_block_table(aiter_calls):
 def test_general_varlen_dropout_record_matches_fa2_layout(aiter_calls):
     # aiter packs varlen as (heads, total_q, max_seqlen_k); FA returns
     # (batch, heads, seqlen_q, seqlen_k), padded rows and columns kept.
+    vq, cu, rng = aiter_calls.vq, aiter_calls.cu, aiter_calls.rng
     randval = torch.tensor([[[0, 255], [211, 212], [100, 0]]], dtype=torch.uint8)
-    aiter_calls.general._flash_attn_varlen_forward.return_value = ("vo", "vl", randval, "vr")
+    aiter_calls.general._flash_attn_varlen_forward.return_value = (vq, torch.zeros(1, 3), randval, rng)
     result = adapter.flash_attn_2.varlen_fwd(
-        "q", "k", "v", None, torch.tensor([0, 1, 3]), "ck", None, None, None,
+        vq, vq, vq, None, cu, cu, None, None, None,
         None, 2, 3, 0.17, 0.5, False, False, -1, -1, 0.0, True,
     )
     expected = torch.tensor([
@@ -2654,15 +2713,16 @@ def test_general_varlen_dropout_record_matches_fa2_layout(aiter_calls):
 
 
 def test_general_varlen_backward_preserves_fa2_return(aiter_calls):
+    vq, cu, rng = aiter_calls.vq, aiter_calls.cu, aiter_calls.rng
+    grads = (torch.zeros_like(vq), torch.zeros_like(vq), torch.zeros_like(vq))
     result = adapter.flash_attn_2.varlen_bwd(
-        "do", "q", "k", "v", "out", "lse", "dq", "dk", "dv",
-        "cq", "ck", None, 64, 128, 0.0, 0.5, False, True,
-        -1, -1, 0.0, False, None, "rng",
+        vq, vq, vq, vq, vq, torch.zeros(1, 3), *grads,
+        cu, cu, None, 2, 3, 0.0, 0.5, False, True,
+        -1, -1, 0.0, False, None, rng,
     )
-    assert result == ("dq", "dk", "dv", "varlen_d")
+    assert all(r is g for r, g in zip(result[:3], grads))
     args = aiter_calls.general._flash_attn_varlen_backward.call_args.args
-    assert args[:11] == ("do", "q", "k", "v", "out", "lse", "dq", "dk", "dv", "cq", "ck")
-    assert args[20] == "rng"
+    assert args[9] is cu and args[20] is rng
     aiter_calls.triton._flash_attn_backward.assert_not_called()
 
 
@@ -2687,21 +2747,23 @@ def test_general_unsupported_args_fail_explicitly(aiter_calls):
 
 def test_triton_route_uses_aiter_mha_with_dao_ai(aiter_calls, monkeypatch):
     monkeypatch.setattr(adapter, "AITER_IMPL", "triton")
-    q = torch.empty(2, 3, 1, 8)
-    result = adapter.flash_attn_2.fwd(q, q, q, None, None, 0.0, 0.5, False, -1, -1, 0.0, False)
-    assert result == ("to", "tl", "tp", "tr")
+    q, vq, cu, rng = aiter_calls.q, aiter_calls.vq, aiter_calls.cu, aiter_calls.rng
+    out, _, s_dmask, rng_state = adapter.flash_attn_2.fwd(
+        q, q, q, None, None, 0.0, 0.5, False, -1, -1, 0.0, False
+    )
+    assert out is q and rng_state is rng and s_dmask.shape == (0,)
     assert aiter_calls.triton._flash_attn_forward.call_args.kwargs == {"implementation": "dao_ai"}
+    grads = (torch.zeros_like(vq), torch.zeros_like(vq), torch.zeros_like(vq))
     result = adapter.flash_attn_2.varlen_bwd(
-        "do", "q", "k", "v", "out", "lse", "dq", "dk", "dv",
-        "cq", "ck", None, 64, 128, 0.0, 0.5, False, True,
-        -1, -1, 0.0, False, None, "rng",
+        vq, vq, vq, vq, vq, torch.zeros(1, 3), *grads,
+        cu, cu, None, 2, 3, 0.0, 0.5, False, True,
+        -1, -1, 0.0, False, None, rng,
     )
-    assert result == ("dq", "dk", "dv", "td")
+    assert result[3] is aiter_calls.triton._flash_attn_backward.return_value
     call = aiter_calls.triton._flash_attn_backward.call_args
-    assert call.args[17:19] == (64, 128)
-    assert call.kwargs == dict(
-        cu_seqlens_q="cq", cu_seqlens_k="ck", rng_state="rng", implementation="dao_ai"
-    )
+    assert call.args[17:19] == (2, 3)
+    assert call.kwargs["cu_seqlens_q"] is cu and call.kwargs["rng_state"] is rng
+    assert call.kwargs["implementation"] == "dao_ai"
     aiter_calls.general._flash_attn_forward.assert_not_called()
 
 
