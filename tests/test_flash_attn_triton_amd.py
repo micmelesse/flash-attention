@@ -2573,26 +2573,14 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
 
 @pytest.mark.skipif(not hasattr(torch.library, "opcheck"), reason="needs torch.library.opcheck")
 @pytest.mark.parametrize("dropout_p, return_softmax", [(0.0, False), (0.17, False), (0.17, True)])
-@pytest.mark.parametrize("varlen", [False, True])
-def test_flash_attn_custom_ops_compile(varlen, dropout_p, return_softmax):
-    """Each backend call returns what FA's register_fake declares, so torch.compile can trace it."""
+def test_flash_attn_custom_ops_compile(dropout_p, return_softmax):
+    """FA's four custom ops return what their register_fake declares, so torch.compile can
+    trace them: the forward and backward, dense, then varlen."""
     torch.manual_seed(0)
     batch, seqlen, nheads, d = 2, 128, 4, 64
     q, k, v = (
         torch.randn(batch, seqlen, nheads, d, device="cuda", dtype=torch.float16) for _ in range(3)
     )
-    if varlen:
-        q, k, v = (x.flatten(0, 1) for x in (q, k, v))
-        cu_seqlens = torch.arange(
-            0, (batch + 1) * seqlen, seqlen, device="cuda", dtype=torch.int32
-        )
-        fwd_op = torch.ops.flash_attn._flash_attn_varlen_forward
-        bwd_op = torch.ops.flash_attn._flash_attn_varlen_backward
-        seqlens = (cu_seqlens, cu_seqlens, seqlen, seqlen)
-    else:
-        fwd_op = torch.ops.flash_attn._flash_attn_forward
-        bwd_op = torch.ops.flash_attn._flash_attn_backward
-        seqlens = ()
     options = dict(
         dropout_p=dropout_p,
         softmax_scale=d**-0.5,
@@ -2603,14 +2591,44 @@ def test_flash_attn_custom_ops_compile(varlen, dropout_p, return_softmax):
         alibi_slopes=None,
     )
     utils = ("test_schema", "test_faketensor")
-    fwd_args = (q, k, v, *seqlens)
-    torch.library.opcheck(fwd_op, fwd_args, dict(options, return_softmax=return_softmax), test_utils=utils)
 
-    out, softmax_lse, _, rng_state = fwd_op(*fwd_args, **options, return_softmax=return_softmax)
-    grads = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))
-    bwd_args = (torch.randn_like(out), q, k, v, out, softmax_lse, *grads, *seqlens)
     torch.library.opcheck(
-        bwd_op, bwd_args, dict(options, deterministic=False, rng_state=rng_state), test_utils=utils
+        torch.ops.flash_attn._flash_attn_forward,
+        (q, k, v),
+        dict(options, return_softmax=return_softmax),
+        test_utils=utils,
+    )
+    out, lse, _, rng_state = torch.ops.flash_attn._flash_attn_forward(
+        q, k, v, **options, return_softmax=return_softmax
+    )
+    torch.library.opcheck(
+        torch.ops.flash_attn._flash_attn_backward,
+        (torch.randn_like(out), q, k, v, out, lse, torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)),
+        dict(options, deterministic=False, rng_state=rng_state),
+        test_utils=utils,
+    )
+
+    q_unpad, k_unpad, v_unpad = (x.flatten(0, 1) for x in (q, k, v))
+    cu_seqlens = torch.arange(0, (batch + 1) * seqlen, seqlen, device="cuda", dtype=torch.int32)
+    torch.library.opcheck(
+        torch.ops.flash_attn._flash_attn_varlen_forward,
+        (q_unpad, k_unpad, v_unpad, cu_seqlens, cu_seqlens, seqlen, seqlen),
+        dict(options, return_softmax=return_softmax),
+        test_utils=utils,
+    )
+    out, lse, _, rng_state = torch.ops.flash_attn._flash_attn_varlen_forward(
+        q_unpad, k_unpad, v_unpad, cu_seqlens, cu_seqlens, seqlen, seqlen, **options,
+        return_softmax=return_softmax,
+    )
+    torch.library.opcheck(
+        torch.ops.flash_attn._flash_attn_varlen_backward,
+        (
+            torch.randn_like(out), q_unpad, k_unpad, v_unpad, out, lse,
+            torch.empty_like(q_unpad), torch.empty_like(k_unpad), torch.empty_like(v_unpad),
+            cu_seqlens, cu_seqlens, seqlen, seqlen,
+        ),
+        dict(options, deterministic=False, rng_state=rng_state),
+        test_utils=utils,
     )
 
 
@@ -2655,33 +2673,25 @@ def test_amd_backend_refusal(monkeypatch, triton, aiter, is_rocm, error, message
         amd_backend.select_amd_backend(is_rocm)
 
 
-@pytest.mark.parametrize(
-    "route, call, message",
-    [
-        ("all", "softcap", "softcap"),
-        ("triton", "varlen_block_table", "block_table"),
-        ("general", "kvcache", "KV-cache attention"),
-        ("general", "softmax_without_dropout", "return_softmax without dropout"),
-    ],
-)
-def test_flash_attn_aiter_refusal(route, call, message):
+def test_flash_attn_aiter_refusal():
     """On the aiter backend, what the selected implementation cannot do fails with a
     named NotImplementedError instead of a wrong answer."""
-    if AMD_BACKEND != "aiter" or route not in ("all", AITER_IMPL):
-        pytest.skip(f"refused only by the aiter {route} implementation")
+    if AMD_BACKEND != "aiter":
+        pytest.skip("refusals of the aiter backend")
     q = torch.randn(2, 128, 4, 64, device="cuda", dtype=torch.float16)
-    with pytest.raises(NotImplementedError, match=message):
-        if call == "softcap":
-            flash_attn_func(q, q, q, softcap=1.0)
-        elif call == "varlen_block_table":
-            cu_seqlens = torch.tensor([0, 128, 256], device="cuda", dtype=torch.int32)
-            block_table = torch.zeros(2, 1, device="cuda", dtype=torch.int32)
+    with pytest.raises(NotImplementedError, match="softcap"):
+        flash_attn_func(q, q, q, softcap=1.0)
+    if AITER_IMPL == "triton":
+        cu_seqlens = torch.tensor([0, 128, 256], device="cuda", dtype=torch.int32)
+        block_table = torch.zeros(2, 1, device="cuda", dtype=torch.int32)
+        with pytest.raises(NotImplementedError, match="block_table"):
             flash_attn_varlen_func(
                 q.flatten(0, 1), q, q, cu_seqlens, cu_seqlens, 128, 128, block_table=block_table
             )
-        elif call == "kvcache":
+    else:
+        with pytest.raises(NotImplementedError, match="KV-cache attention"):
             flash_attn_with_kvcache(q, q, q)
-        else:
+        with pytest.raises(NotImplementedError, match="return_softmax without dropout"):
             torch.ops.flash_attn._flash_attn_forward(
                 q, q, q, 0.0, 64**-0.5, False, -1, -1, 0.0, None, True
             )
