@@ -1,10 +1,15 @@
+import contextlib
 import math
+import sys
+import types
 
 import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
+
 from flash_attn import (
+    amd_backend,
     flash_attn_func,
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
@@ -14,17 +19,20 @@ from flash_attn import (
     flash_attn_with_kvcache,
 )
 from flash_attn.bert_padding import pad_input, unpad_input
-from flash_attn.flash_attn_interface import _get_block_size_n
+from flash_attn.flash_attn_interface import AITER_IMPL, AMD_BACKEND, _get_block_size_n
 from flash_attn.layers.rotary import apply_rotary_emb
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import USE_TRITON_ROCM, is_hip, get_arch
+
+
+ARCH = torch.cuda.get_device_properties("cuda").gcnArchName if torch.version.hip else ""
+IS_RDNA = ARCH.startswith(("gfx11", "gfx12"))
+IS_CDNA = ARCH.startswith("gfx9")
 
 
 def _get_block_size_n_triton(device, head_dim, is_dropout, is_causal):
     """Get block size for Triton AMD kernel."""
-    arch = get_arch()
-    if arch.is_rdna:
+    if IS_RDNA:
         return 32
-    elif arch.is_cdna:
+    elif IS_CDNA:
         return 64
     # Fall back to CUDA kernel block sizes
     return _get_block_size_n(device, head_dim, is_dropout, is_causal)
@@ -38,7 +46,7 @@ is_sm8x = torch.cuda.get_device_capability("cuda")[0] == 8
 is_sm80 = torch.cuda.get_device_capability("cuda") == (8, 0)
 is_sm90 = torch.cuda.get_device_capability("cuda") == (9, 0)
 
-skip_bfloat16 = True if is_sm75 or is_hip() else False
+skip_bfloat16 = True if is_sm75 or torch.version.hip is not None else False
 
 
 def attn_bias_from_alibi_slopes(
@@ -918,7 +926,7 @@ def test_flash_attn_varlen_qkvpacked(
 def test_flash_attn_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
-    if USE_TRITON_ROCM:
+    if AITER_IMPL == "triton":
         if causal:
             if seqlen_q ==1024 and seqlen_k==1024 and d==160:
                 pytest.skip("This test with causal=True is flakey")
@@ -1191,7 +1199,7 @@ def test_flash_attn_output(
 def test_flash_attn_varlen_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
-    if USE_TRITON_ROCM:
+    if AITER_IMPL == "triton":
         if seqlen_q == 1 and seqlen_k == 147 and kvpacked == True and dropout_p != 0.0:
             pytest.skip("This config with dropout is flaky on AMD.")
     if (
@@ -1502,8 +1510,8 @@ def test_flash_attn_varlen_output(
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
 def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
-    if USE_TRITON_ROCM:
-        if get_arch().is_rdna:
+    if AITER_IMPL == "triton":
+        if IS_RDNA:
             if seqlen_q == 1 and seqlen_k == 239 and d == 256:
                 pytest.skip("This config doesnot work on RDNA Devices.")
     if (
@@ -1792,7 +1800,7 @@ def test_flash_attn_varlen_causal(
 def test_flash_attn_splitkv(
     seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, alibi, deterministic, dtype
 ):
-    if USE_TRITON_ROCM:
+    if AITER_IMPL == "triton":
         if seqlen_q == 1 and seqlen_k == 339 and swap_sq_sk == True:
             pytest.skip("This config with is flaky on AMD.")
     if swap_sq_sk:
@@ -1952,6 +1960,8 @@ def test_flash_attn_kvcache(
     num_splits,
     dtype,
 ):
+    if AITER_IMPL == "general":
+        pytest.skip("KV-cache attention is not supported by the aiter general implementation")
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
@@ -2559,3 +2569,129 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         assert torch.equal(dv, dv0)
         assert torch.equal(dk, dk0)
         assert torch.equal(dq, dq0)
+
+
+@pytest.mark.skipif(not hasattr(torch.library, "opcheck"), reason="needs torch.library.opcheck")
+@pytest.mark.parametrize("dropout_p, return_softmax", [(0.0, False), (0.17, False), (0.17, True)])
+def test_flash_attn_custom_ops_compile(dropout_p, return_softmax):
+    """FA's four custom ops return what their register_fake declares, so torch.compile can
+    trace them: the forward and backward, dense, then varlen."""
+    torch.manual_seed(0)
+    batch, seqlen, nheads, d = 2, 128, 4, 64
+    q, k, v = (
+        torch.randn(batch, seqlen, nheads, d, device="cuda", dtype=torch.float16) for _ in range(3)
+    )
+    options = dict(
+        dropout_p=dropout_p,
+        softmax_scale=d**-0.5,
+        causal=True,
+        window_size_left=-1,
+        window_size_right=-1,
+        softcap=0.0,
+        alibi_slopes=None,
+    )
+    utils = ("test_schema", "test_faketensor")
+
+    torch.library.opcheck(
+        torch.ops.flash_attn._flash_attn_forward,
+        (q, k, v),
+        dict(options, return_softmax=return_softmax),
+        test_utils=utils,
+    )
+    out, lse, _, rng_state = torch.ops.flash_attn._flash_attn_forward(
+        q, k, v, **options, return_softmax=return_softmax
+    )
+    torch.library.opcheck(
+        torch.ops.flash_attn._flash_attn_backward,
+        (torch.randn_like(out), q, k, v, out, lse, torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)),
+        dict(options, deterministic=False, rng_state=rng_state),
+        test_utils=utils,
+    )
+
+    q_unpad, k_unpad, v_unpad = (x.flatten(0, 1) for x in (q, k, v))
+    cu_seqlens = torch.arange(0, (batch + 1) * seqlen, seqlen, device="cuda", dtype=torch.int32)
+    torch.library.opcheck(
+        torch.ops.flash_attn._flash_attn_varlen_forward,
+        (q_unpad, k_unpad, v_unpad, cu_seqlens, cu_seqlens, seqlen, seqlen),
+        dict(options, return_softmax=return_softmax),
+        test_utils=utils,
+    )
+    out, lse, _, rng_state = torch.ops.flash_attn._flash_attn_varlen_forward(
+        q_unpad, k_unpad, v_unpad, cu_seqlens, cu_seqlens, seqlen, seqlen, **options,
+        return_softmax=return_softmax,
+    )
+    torch.library.opcheck(
+        torch.ops.flash_attn._flash_attn_varlen_backward,
+        (
+            torch.randn_like(out), q_unpad, k_unpad, v_unpad, out, lse,
+            torch.empty_like(q_unpad), torch.empty_like(k_unpad), torch.empty_like(v_unpad),
+            cu_seqlens, cu_seqlens, seqlen, seqlen,
+        ),
+        dict(options, deterministic=False, rng_state=rng_state),
+        test_utils=utils,
+    )
+
+
+@pytest.mark.parametrize(
+    "triton, aiter, is_rocm, has_ck, expected",
+    [
+        ("FALSE", "FALSE", None, False, ("ck", None)),
+        ("TRUE", "FALSE", None, False, ("aiter", "triton")),
+        ("FALSE", "TRUE", None, False, ("aiter", "general")),
+        ("FALSE", "FALSE", False, False, ("ck", None)),
+        ("FALSE", "FALSE", True, True, ("ck", None)),
+        ("FALSE", "FALSE", True, False, ("aiter", "triton")),
+        ("TRUE", "FALSE", True, True, ("aiter", "triton")),
+        ("FALSE", "TRUE", True, True, ("aiter", "general")),
+    ],
+)
+def test_amd_backend_routing(monkeypatch, triton, aiter, is_rocm, has_ck, expected):
+    """The flags select one backend; on ROCm without the CK extension FlashAttention falls
+    back to aiter's Triton implementation with a warning."""
+    monkeypatch.setenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", triton)
+    monkeypatch.setenv("FLASH_ATTENTION_AITER_AMD_ENABLE", aiter)
+    module = types.ModuleType("flash_attn_2_cuda") if has_ck else None
+    monkeypatch.setitem(sys.modules, "flash_attn_2_cuda", module)
+    falls_back = is_rocm and not has_ck and triton == aiter == "FALSE"
+    with pytest.warns(UserWarning, match="falling back") if falls_back else contextlib.nullcontext():
+        assert amd_backend.select_amd_backend(is_rocm) == expected
+
+
+@pytest.mark.parametrize(
+    "triton, aiter, is_rocm, error, message",
+    [
+        ("TRUE", "TRUE", None, ValueError, "Select only one"),
+        ("TRUE", "TRUE", True, ValueError, "Select only one"),
+        ("FALSE", "TRUE", False, RuntimeError, "requires ROCm"),
+    ],
+)
+def test_amd_backend_refusal(monkeypatch, triton, aiter, is_rocm, error, message):
+    """Contradictory or impossible flags fail with a named error."""
+    monkeypatch.setenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", triton)
+    monkeypatch.setenv("FLASH_ATTENTION_AITER_AMD_ENABLE", aiter)
+    with pytest.raises(error, match=message):
+        amd_backend.select_amd_backend(is_rocm)
+
+
+def test_flash_attn_aiter_refusal():
+    """On the aiter backend, what the selected implementation cannot do fails with a
+    named NotImplementedError instead of a wrong answer."""
+    if AMD_BACKEND != "aiter":
+        pytest.skip("refusals of the aiter backend")
+    q = torch.randn(2, 128, 4, 64, device="cuda", dtype=torch.float16)
+    with pytest.raises(NotImplementedError, match="softcap"):
+        flash_attn_func(q, q, q, softcap=1.0)
+    if AITER_IMPL == "triton":
+        cu_seqlens = torch.tensor([0, 128, 256], device="cuda", dtype=torch.int32)
+        block_table = torch.zeros(2, 1, device="cuda", dtype=torch.int32)
+        with pytest.raises(NotImplementedError, match="block_table"):
+            flash_attn_varlen_func(
+                q.flatten(0, 1), q, q, cu_seqlens, cu_seqlens, 128, 128, block_table=block_table
+            )
+    else:
+        with pytest.raises(NotImplementedError, match="KV-cache attention"):
+            flash_attn_with_kvcache(q, q, q)
+        with pytest.raises(NotImplementedError, match="return_softmax without dropout"):
+            torch.ops.flash_attn._flash_attn_forward(
+                q, q, q, 0.0, 64**-0.5, False, -1, -1, 0.0, None, True
+            )

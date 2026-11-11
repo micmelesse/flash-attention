@@ -17,7 +17,7 @@ if not USE_TRITON_ROCM and getattr(torch.version, 'hip', None) is not None:
         USE_TRITON_ROCM = True
 
 if USE_TRITON_ROCM:
-    from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3 as flash_attn_3_gpu
+    from flash_attn_interface_aiter import flash_attn_3 as flash_attn_3_gpu
 else:
     # isort: off
     # We need to import the CUDA kernels after importing torch
